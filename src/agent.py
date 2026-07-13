@@ -1,6 +1,6 @@
 import logging
 import textwrap
-
+from pprint import pformat, pprint
 from dotenv import load_dotenv
 from livekit.agents import (
     Agent,
@@ -11,28 +11,32 @@ from livekit.agents import (
     cli,
     inference,
     room_io,
+    ConversationItemAddedEvent
 )
+import json
 from livekit.plugins import ai_coustics
-
+import transcript
+import aiohttp
+import asyncio
 logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
 
+def inspect_object(name: str, obj):
+    logger.info("=" * 60)
+    logger.info(f"{name}")
+    logger.info("=" * 60)
+    logger.info(f"Type: {type(obj)}")
+    logger.info(f"Representation: \n{obj}")
+    logger.info(f"Attributes: \n{pformat(dir(obj))}")
+
+
+interview_id = None
 
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
-            # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-            # See all available models at https://docs.livekit.io/agents/models/llm/
             llm=inference.LLM(model="google/gemma-4-31b-it"),
-            # To use a realtime model instead of a voice pipeline, replace the LLM
-            # with a RealtimeModel and remove the STT/TTS from the AgentSession
-            # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/)
-            # 1. Install livekit-agents[openai]
-            # 2. Set OPENAI_API_KEY in .env.local
-            # 3. Add `from livekit.plugins import openai` to the top of this file
-            # 4. Replace the llm argument with:
-            #     llm=openai.realtime.RealtimeModel(voice="marin")
             instructions=textwrap.dedent(
                 """\
                 You are a friendly, reliable voice assistant that answers questions, explains topics, and completes tasks with available tools.
@@ -70,59 +74,35 @@ class Assistant(Agent):
             ),
         )
 
-    # To add tools, use the @function_tool decorator.
-    # Here's an example that adds a simple weather tool.
-    # You also have to add `from livekit.agents import function_tool, RunContext` to the top of this file
-    # @function_tool
-    # async def lookup_weather(self, context: RunContext, location: str):
-    #     """Use this tool to look up current weather information in the given location.
-    #
-    #     If the location is not supported by the weather service, the tool will indicate this. You must tell the user the location's weather is unavailable.
-    #
-    #     Args:
-    #         location: The location to look up weather information for (e.g. city name)
-    #     """
-    #
-    #     logger.info(f"Looking up weather for {location}")
-    #
-    #     return "sunny with a temperature of 70 degrees."
-
 
 server = AgentServer()
 
 
 @server.rtc_session(agent_name="my-agent")
 async def my_agent(ctx: JobContext):
-    # Logging setup
-    # Add any other context you want in all log entries here
+    interview_id = None
+    if ctx.job.metadata:
+        try:
+            interview_id = json.loads(ctx.job.metadata).get("interviewId")
+        except (json.JSONDecodeError, AttributeError):
+            interview_id = ctx.job.metadata
+
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
 
-    # Set up a voice AI pipeline using OpenAI, Cartesia, Deepgram, and the LiveKit turn detector
     session = AgentSession(
-        # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
-        # See all available models at https://docs.livekit.io/agents/models/stt/
+        
         stt=inference.STT(model="deepgram/nova-3", language="multi"),
-        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
-        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
         tts=inference.TTS(
             model="cartesia/sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
         ),
-        # The LiveKit turn detector determines when the user is done speaking and the agent should respond.
-        # TurnDetector is an end-of-turn model that listens to the user's audio directly, combining
-        # semantic understanding with acoustic cues (intonation, pitch, rhythm) for state-of-the-art accuracy.
-        # AgentSession supplies the required VAD automatically.
-        # See more at https://docs.livekit.io/agents/build/turns
         turn_handling=TurnHandlingOptions(
             turn_detection=inference.TurnDetector(),
         ),
-        # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
     )
 
-    # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
         agent=Assistant(),
         room=ctx.room,
@@ -134,20 +114,41 @@ async def my_agent(ctx: JobContext):
             ),
         ),
     )
+    http = aiohttp.ClientSession()
+    pending: set[asyncio.Task] = set()
 
-    # # Add a virtual avatar to the session, if desired
-    # # For other providers, see https://docs.livekit.io/agents/models/avatar/
-    # avatar = anam.AvatarSession(
-    #     persona_config=anam.PersonaConfig(
-    #         name="...",
-    #         avatarId="...",  # See https://docs.livekit.io/agents/models/avatar/plugins/anam
-    #     ),
-    # )
-    # # Start the avatar and wait for it to join
-    # await avatar.start(session, room=ctx.room)
+    def _save(role: str, content: str, created_at: float):
+        task = asyncio.create_task(
+            transcript.save_message(http, interview_id, role, content, created_at)
+        )
+        pending.add(task)
+        task.add_done_callback(pending.discard)
 
-    # Join the room and connect to the user
+    aggregator = transcript.TurnAggregator(_save)
+
+    @session.on("conversation_item_added")
+    def _on_item(ev: ConversationItemAddedEvent):
+        aggregator.add(ev.item.role, ev.item.text_content, ev.created_at)
+
+    async def _flush_and_close():
+        aggregator.flush()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await transcript.complete_interview(http, interview_id=interview_id)
+        await http.close()
+
+    ctx.add_shutdown_callback(_flush_and_close)
+
     await ctx.connect()
+    participant = await ctx.wait_for_participant()
+    logger.info(f"{participant.identity} joined!")
+
+    await ctx.primary_session.say(
+        "Hello! Welcome to Quick Hire. I'll be conducting your technical interview today. We'll begin with a few questions based on your resume. Let me know when you're ready."
+    )
+    pprint(ctx.primary_session.history.messages())
+    logger.info("=" * 50)
+    pprint(ctx.primary_session.history.items)
 
 
 if __name__ == "__main__":
