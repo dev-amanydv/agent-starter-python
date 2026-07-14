@@ -1,3 +1,6 @@
+import aiohttp
+
+import transcript
 from transcript import TurnAggregator
 
 
@@ -20,7 +23,11 @@ def test_merges_consecutive_same_role_items():
 
     agg.add("assistant", "That sounds relevant.", 4.0)
     assert turns == [
-        ("user", "I worked on an project, like, would ask the user about context of user's resume.", 1.0)
+        (
+            "user",
+            "I worked on an project, like, would ask the user about context of user's resume.",
+            1.0,
+        )
     ]
 
 
@@ -74,3 +81,67 @@ def test_flush_is_idempotent_when_empty():
     agg.flush()
 
     assert turns == []
+
+
+# ── upload_recording ─────────────────────────────────────────────────────────
+class _FakeResp:
+    def __init__(self, status: int = 201) -> None:
+        self.status = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return False
+
+    async def text(self) -> str:
+        return ""
+
+
+class _FakeHttp:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def post(self, url, data=None, headers=None, timeout=None):
+        self.calls.append({"url": url, "data": data, "headers": headers})
+        return _FakeResp()
+
+
+async def test_upload_recording_skips_when_file_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(transcript, "INTERNAL_SECRET", "secret")
+    http = _FakeHttp()
+    await transcript.upload_recording(http, "iv1", tmp_path / "missing.ogg")
+    assert http.calls == []
+
+
+async def test_upload_recording_skips_empty_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(transcript, "INTERNAL_SECRET", "secret")
+    empty = tmp_path / "audio.ogg"
+    empty.write_bytes(b"")
+    http = _FakeHttp()
+    await transcript.upload_recording(http, "iv1", empty)
+    assert http.calls == []
+
+
+async def test_upload_recording_skips_without_secret(tmp_path, monkeypatch):
+    monkeypatch.setattr(transcript, "INTERNAL_SECRET", None)
+    f = tmp_path / "audio.ogg"
+    f.write_bytes(b"some-audio-bytes")
+    http = _FakeHttp()
+    await transcript.upload_recording(http, "iv1", f)
+    assert http.calls == []
+
+
+async def test_upload_recording_posts_multipart(tmp_path, monkeypatch):
+    monkeypatch.setattr(transcript, "INTERNAL_SECRET", "secret")
+    f = tmp_path / "audio.ogg"
+    f.write_bytes(b"some-audio-bytes")
+    http = _FakeHttp()
+
+    await transcript.upload_recording(http, "iv1", f)
+
+    assert len(http.calls) == 1
+    call = http.calls[0]
+    assert call["url"].endswith("/interview/iv1/recording/upload")
+    assert call["headers"]["x-internal-secret"] == "secret"
+    assert isinstance(call["data"], aiohttp.FormData)

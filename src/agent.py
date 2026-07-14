@@ -349,6 +349,12 @@ async def my_agent(ctx: JobContext):
                 ),
             ),
         ),
+        # Record the mixed conversation locally (candidate mic -> left, agent TTS ->
+        # right) as an OGG/Opus file at ``ctx.session_directory / "audio.ogg"``. This is
+        # the LiveKit Agents in-process recorder, NOT Cloud Egress, so it costs no metered
+        # egress minutes. We only want the audio; traces/logs/transcript are handled
+        # elsewhere (the transcript is persisted per-turn to our own backend).
+        record={"audio": True, "traces": False, "logs": False, "transcript": False},
     )
     http = aiohttp.ClientSession()
     pending: set[asyncio.Task] = set()
@@ -371,6 +377,15 @@ async def my_agent(ctx: JobContext):
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         await transcript.complete_interview(http, interview_id=interview_id)
+        # The recorder is finalized in ``JobContext._on_session_end`` which runs *before*
+        # shutdown callbacks, so ``audio.ogg`` is complete and still on disk here (the
+        # temp dir is only cleaned up afterwards). Ship it to our backend -> R2.
+        try:
+            await transcript.upload_recording(
+                http, interview_id, ctx.session_directory / "audio.ogg"
+            )
+        except Exception:
+            logger.exception("recording upload failed (continuing)")
         await http.close()
 
     ctx.add_shutdown_callback(_flush_and_close)
