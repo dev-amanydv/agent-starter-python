@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import aiohttp
 
 import transcript
@@ -145,3 +147,51 @@ async def test_upload_recording_posts_multipart(tmp_path, monkeypatch):
     assert call["url"].endswith("/interview/iv1/recording/upload")
     assert call["headers"]["x-internal-secret"] == "secret"
     assert isinstance(call["data"], aiohttp.FormData)
+
+
+# ── prepare_and_upload_recording (transcode dispatch) ────────────────────────
+def _capture_uploads(monkeypatch):
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_upload(
+        http, iid, path, *, content_type="audio/ogg", filename="interview.ogg"
+    ):
+        calls.append((Path(path).name, content_type, filename))
+
+    monkeypatch.setattr(transcript, "upload_recording", fake_upload)
+    return calls
+
+
+async def test_prepare_uploads_m4a_when_transcode_succeeds(tmp_path, monkeypatch):
+    src = tmp_path / "audio.ogg"
+    src.write_bytes(b"ogg-bytes")
+    calls = _capture_uploads(monkeypatch)
+    monkeypatch.setattr(transcript, "_transcode_to_m4a", lambda s, d: True)
+
+    await transcript.prepare_and_upload_recording(None, "iv1", src)
+
+    assert calls == [("audio.m4a", "audio/mp4", "interview.m4a")]
+
+
+async def test_prepare_falls_back_to_ogg_when_transcode_fails(tmp_path, monkeypatch):
+    src = tmp_path / "audio.ogg"
+    src.write_bytes(b"ogg-bytes")
+    calls = _capture_uploads(monkeypatch)
+    monkeypatch.setattr(transcript, "_transcode_to_m4a", lambda s, d: False)
+
+    await transcript.prepare_and_upload_recording(None, "iv1", src)
+
+    assert calls == [("audio.ogg", "audio/ogg", "interview.ogg")]
+
+
+async def test_prepare_skips_when_source_missing(tmp_path, monkeypatch):
+    calls = _capture_uploads(monkeypatch)
+    monkeypatch.setattr(
+        transcript,
+        "_transcode_to_m4a",
+        lambda s, d: (_ for _ in ()).throw(AssertionError("should not transcode")),
+    )
+
+    await transcript.prepare_and_upload_recording(None, "iv1", tmp_path / "missing.ogg")
+
+    assert calls == []

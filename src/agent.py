@@ -379,9 +379,10 @@ async def my_agent(ctx: JobContext):
         await transcript.complete_interview(http, interview_id=interview_id)
         # The recorder is finalized in ``JobContext._on_session_end`` which runs *before*
         # shutdown callbacks, so ``audio.ogg`` is complete and still on disk here (the
-        # temp dir is only cleaned up afterwards). Ship it to our backend -> R2.
+        # temp dir is only cleaned up afterwards). Transcode to Safari/iOS-friendly AAC
+        # and ship it to our backend -> R2.
         try:
-            await transcript.upload_recording(
+            await transcript.prepare_and_upload_recording(
                 http, interview_id, ctx.session_directory / "audio.ogg"
             )
         except Exception:
