@@ -320,7 +320,7 @@ class Assistant(Agent):
         )
 
 
-server = AgentServer(setup_fnc=prewarm)
+server = AgentServer(setup_fnc=prewarm, num_idle_processes=1)
 
 
 @server.rtc_session(agent_name="my-agent")
